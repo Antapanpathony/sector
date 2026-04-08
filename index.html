@@ -1,0 +1,689 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Asteroid Sector Command</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  background:#000;
+  display:flex; flex-direction:column; align-items:center; justify-content:center;
+  min-height:100vh;
+  font-family:'Courier New',monospace;
+  user-select:none;
+  overflow:hidden;
+}
+#canvas { display:block; cursor:crosshair; border:1px solid #1a1a3a; }
+#hud {
+  width:900px;
+  background:#06060f;
+  border:1px solid #1a1a3a; border-top:none;
+  display:flex; align-items:stretch;
+}
+.hp { padding:6px 12px; border-right:1px solid #1a1a3a; display:flex; flex-direction:column; justify-content:center; gap:3px; }
+.hp:last-child { border-right:none; flex:1; }
+.hl { color:#334; font-size:9px; text-transform:uppercase; letter-spacing:1.5px; }
+.hv { color:#88ccff; font-size:15px; font-weight:bold; }
+.hv.warn { color:#ffaa33; }
+.br { display:flex; gap:4px; align-items:center; flex-wrap:wrap; }
+.sb {
+  background:#0d0d20; color:#6688cc;
+  border:1px solid #223355;
+  padding:3px 9px; cursor:pointer;
+  font-family:monospace; font-size:11px;
+  transition:all .12s;
+}
+.sb:hover:not([disabled]) { background:#1a1a38; border-color:#4466aa; color:#88aaff; }
+.sb[disabled] { color:#2a2a2a; border-color:#111; cursor:default; }
+.st { color:#445; font-size:11px; line-height:1.6; }
+</style>
+</head>
+<body>
+<canvas id="canvas" width="900" height="580"></canvas>
+<div id="hud">
+  <div class="hp" style="min-width:115px">
+    <div class="hl">Minerals</div>
+    <div class="hv" id="hres">200</div>
+  </div>
+  <div class="hp" style="min-width:115px">
+    <div class="hl">Sectors</div>
+    <div class="hv" id="hnodes">0 / 9</div>
+  </div>
+  <div class="hp" style="flex:1">
+    <div class="hl">Deploy Unit</div>
+    <div class="br">
+      <button class="sb" data-t="SCOUT"   onclick="G.spawn('SCOUT')">Scout [40]</button>
+      <button class="sb" data-t="MINER"   onclick="G.spawn('MINER')">Miner [50]</button>
+      <button class="sb" data-t="FIGHTER" onclick="G.spawn('FIGHTER')">Fighter [75]</button>
+      <button class="sb" data-t="BOMBER"  onclick="G.spawn('BOMBER')">Bomber [100]</button>
+      <button class="sb" data-t="TANK"    onclick="G.spawn('TANK')">Tank [120]</button>
+    </div>
+  </div>
+  <div class="hp" style="min-width:210px">
+    <div class="hl">Command</div>
+    <div class="st" id="hstat">Click/drag to select &nbsp;·&nbsp; Right-click to order &nbsp;·&nbsp; A=all</div>
+  </div>
+</div>
+<script>
+'use strict';
+// ═══════════════════════════════════════════════════
+//  ASTEROID SECTOR COMMAND  —  RTS mining territory
+// ═══════════════════════════════════════════════════
+
+const CV = document.getElementById('canvas');
+const CX = CV.getContext('2d');
+const W = CV.width, H = CV.height;
+
+// ── Unit definitions [hp, atk, rng, spd, cost, sz, capRate, atkCooldown, aoe]
+const DEFS = {
+  SCOUT:  [ 30,  8, 50, 195,  40,  5, 1.0, 0.85,  0],
+  MINER:  [ 50,  5, 35,  60,  50,  7, 2.5, 1.20,  0],
+  FIGHTER:[ 75, 18, 55, 115,  75,  7, 1.0, 1.00,  0],
+  BOMBER: [ 55, 35, 60,  70, 100,  8, 0.8, 2.00, 50],
+  TANK:   [175, 22, 48,  42, 120, 10, 0.5, 1.50,  0],
+};
+const [iHP,iATK,iRNG,iSPD,iCOST,iSZ,iCAP,iACD,iAOE] = [0,1,2,3,4,5,6,7,8];
+
+// ── Node grid layout (3×3)
+const NODE_XY = [
+  [175,110],[450, 85],[725,110],
+  [135,290],[450,290],[765,290],
+  [175,470],[450,495],[725,470],
+];
+const CAP_R    = 65;   // proximity radius to capture
+const CAP_FULL = 100;  // ticks = fully owned
+
+// ── Per-faction colors
+const PCOL = {SCOUT:'#00ddff',MINER:'#55ff88',FIGHTER:'#5588ff',BOMBER:'#ffaa33',TANK:'#cc77ff'};
+const ACOL = {SCOUT:'#ff5533',MINER:'#ff8855',FIGHTER:'#ff3322',BOMBER:'#ff7700',TANK:'#ff2244'};
+const NCOL = {neutral:'#4455aa', player:'#2266ff', ai:'#ff3333'};
+
+// ── Stars (deterministic-ish twinkle)
+const STARS = Array.from({length:240}, () => ({
+  x: Math.random()*W, y: Math.random()*H,
+  r: Math.random()*1.4+0.2,
+  a: Math.random()*0.55+0.1,
+  phase: Math.random()*Math.PI*2,
+}));
+
+// ── Asteroid shapes — seeded irregular polygons per node
+function makeAsteroid(seed, pts=8, base=18) {
+  let s = (seed+1) * 7919;
+  const rng = () => { s = (s*1664525 + 1013904223) & 0xFFFFFFFF; return (s>>>0)/0xFFFFFFFF; };
+  return Array.from({length:pts}, (_,i) => {
+    const a = (i/pts)*Math.PI*2;
+    const r = base*(0.55 + rng()*0.5);
+    return [Math.cos(a)*r, Math.sin(a)*r];
+  });
+}
+const ASHAPES = NODE_XY.map((_,i) => makeAsteroid(i));
+
+
+// ═══════════════════════════════════════════════════
+//  GAME CLASS
+// ═══════════════════════════════════════════════════
+class Game {
+  constructor() {
+    this.t     = 0;
+    this.over  = false;
+    this.msg   = '';
+    this.msgC  = '#fff';
+
+    // Nodes: ticks in [-100,100], owner derived
+    this.nodes = NODE_XY.map(([x,y],i) => ({
+      id:i, x, y, ticks:0, owner:'neutral', flashT:0
+    }));
+
+    this.units  = [];
+    this.uid    = 0;
+    this.sel    = new Set();   // selected player unit IDs
+    this.fxs    = [];          // visual effects
+    this.pRes   = 200;
+    this.aRes   = 200;
+    this.aiT    = 0;
+    this.drag   = null;        // drag-select state
+
+    // Starting units
+    this._add('FIGHTER','player', 75, 215);
+    this._add('MINER',  'player', 75, 290);
+    this._add('FIGHTER','player', 75, 365);
+    this._add('FIGHTER','ai',    825, 215);
+    this._add('MINER',  'ai',    825, 290);
+    this._add('FIGHTER','ai',    825, 365);
+  }
+
+  // ── Spawn unit
+  _add(type, faction, x, y) {
+    const d = DEFS[type];
+    const u = {
+      id:this.uid++, type, faction,
+      x, y, tx:x, ty:y,
+      hp:d[iHP], mhp:d[iHP],
+      order:null,   // {kind:'move'} | {kind:'attack', tid}
+      acd:0, flashT:0,
+    };
+    this.units.push(u);
+    return u;
+  }
+
+  spawn(type) {
+    if (this.over) return;
+    const cost = DEFS[type][iCOST];
+    if (this.pRes < cost) return;
+    this.pRes -= cost;
+    this._add(type, 'player', 52, H/2 + (Math.random()-.5)*130);
+  }
+
+  // ── Update loop
+  update(dt) {
+    if (this.over) return;
+    this.t += dt;
+
+    // Resource income from owned nodes
+    for (const n of this.nodes) {
+      if (n.owner==='player') this.pRes = Math.min(9999, this.pRes + dt*9);
+      if (n.owner==='ai')     this.aRes = Math.min(9999, this.aRes + dt*9);
+      if (n.flashT > 0) n.flashT -= dt;
+    }
+
+    // Expire effects
+    this.fxs = this.fxs.filter(e => (e.life -= dt) > 0);
+
+    // AI think
+    this.aiT -= dt;
+    if (this.aiT <= 0) { this._ai(); this.aiT = 2.6; }
+
+    // Update units, collect dead
+    const alive = [];
+    for (const u of this.units) {
+      this._tick(u, dt);
+      if (u.hp > 0) { alive.push(u); }
+      else { this.sel.delete(u.id); this._fx(u.x, u.y, 'boom'); }
+    }
+    this.units = alive;
+
+    // Node capture
+    this._capNodes(dt);
+
+    // Win check
+    this._checkEnd();
+    this._hud();
+  }
+
+  // ── Per-unit tick
+  _tick(u, dt) {
+    const d = DEFS[u.type];
+    u.acd    = Math.max(0, u.acd - dt);
+    u.flashT = Math.max(0, u.flashT - dt);
+
+    // Resolve explicit attack order target position
+    if (u.order?.kind === 'attack') {
+      const tgt = this.units.find(t => t.id===u.order.tid && t.hp>0);
+      if (tgt) { u.tx = tgt.x; u.ty = tgt.y; }
+      else     { u.order = null; }
+    }
+
+    // Find nearest enemy within engagement envelope
+    const foes   = this.units.filter(e => e.faction!==u.faction && e.hp>0);
+    const engR   = d[iRNG] * 1.85;
+    let near=null, nearD=Infinity;
+    for (const f of foes) {
+      const dd = dist(u,f);
+      if (dd < nearD && dd < engR) { nearD=dd; near=f; }
+    }
+
+    if (near) {
+      if (nearD <= d[iRNG]) {
+        // ─ In attack range: fire
+        if (u.acd <= 0) {
+          const dmg = d[iATK] * (0.75 + Math.random()*0.5);
+          near.hp -= dmg;
+          near.flashT = 0.12;
+          u.acd = d[iACD];
+          this._fx(near.x, near.y, 'hit');
+
+          // AoE splash (Bomber)
+          if (d[iAOE] > 0) {
+            for (const f of foes) {
+              if (f!==near && dist(near,f) <= d[iAOE]) {
+                f.hp -= dmg * 0.45;
+                f.flashT = 0.1;
+                this._fx(f.x, f.y, 'hit');
+              }
+            }
+          }
+        }
+        // Hold at range edge — don't advance further
+        if (nearD > d[iRNG]*0.82) {
+          const dx=near.x-u.x, dy=near.y-u.y, dd=Math.sqrt(dx*dx+dy*dy);
+          const step = d[iSPD]*dt;
+          const advance = Math.min(step, dd - d[iRNG]*0.82);
+          if (advance > 0) { u.x += dx/dd*advance; u.y += dy/dd*advance; }
+        }
+        return;
+      }
+      // Chase into range
+      u.tx = near.x; u.ty = near.y;
+    }
+
+    // Move toward tx,ty
+    const dx=u.tx-u.x, dy=u.ty-u.y;
+    const dd=Math.sqrt(dx*dx+dy*dy);
+    if (dd > 4) {
+      const step = d[iSPD]*dt;
+      u.x += dx/dd * Math.min(step, dd);
+      u.y += dy/dd * Math.min(step, dd);
+    } else if (u.order?.kind==='move') {
+      u.order = null;
+    }
+
+    // Clamp to canvas
+    const sz = d[iSZ];
+    u.x = Math.max(sz, Math.min(W-sz, u.x));
+    u.y = Math.max(sz, Math.min(H-sz, u.y));
+  }
+
+  // ── Node capture
+  _capNodes(dt) {
+    for (const n of this.nodes) {
+      let ps=0, as=0;
+      for (const u of this.units) {
+        if (dist(u,n) < CAP_R) {
+          if (u.faction==='player') ps += DEFS[u.type][iCAP];
+          else                      as += DEFS[u.type][iCAP];
+        }
+      }
+      const prev = n.owner;
+      if      (ps>0 && as===0) n.ticks = Math.min( CAP_FULL, n.ticks + ps*30*dt);
+      else if (as>0 && ps===0) n.ticks = Math.max(-CAP_FULL, n.ticks - as*30*dt);
+
+      if      (n.ticks >=  CAP_FULL) n.owner = 'player';
+      else if (n.ticks <= -CAP_FULL) n.owner = 'ai';
+      else                           n.owner = 'neutral';
+
+      if (n.owner!==prev && n.owner!=='neutral') n.flashT = 0.7;
+    }
+  }
+
+
+  // ── Win / lose
+  _checkEnd() {
+    const pu = this.units.filter(u=>u.faction==='player').length;
+    const au = this.units.filter(u=>u.faction==='ai').length;
+    const pn = this.nodes.filter(n=>n.owner==='player').length;
+    const an = this.nodes.filter(n=>n.owner==='ai').length;
+
+    if (pn >= 7) return this._end('SECTOR DOMINATION — VICTORY',  '#44ff88');
+    if (an >= 7) return this._end('SECTORS OVERRUN — DEFEAT',     '#ff4444');
+    if (au===0 && this.aRes < DEFS.SCOUT[iCOST])
+                 return this._end('ENEMY ANNIHILATED — VICTORY',  '#44ff88');
+    if (pu===0 && this.pRes < DEFS.SCOUT[iCOST])
+                 return this._end('FORCES DESTROYED — DEFEAT',    '#ff4444');
+  }
+
+  _end(msg, col) { this.over=true; this.msg=msg; this.msgC=col; }
+
+  // ── Shallow AI
+  _ai() {
+    const aiU  = this.units.filter(u=>u.faction==='ai');
+    const plU  = this.units.filter(u=>u.faction==='player');
+    const myN  = this.nodes.filter(n=>n.owner==='ai');
+    const foeN = this.nodes.filter(n=>n.owner==='player');
+    const neuN = this.nodes.filter(n=>n.owner==='neutral');
+    const uncap = [...neuN, ...foeN];
+
+    // ─ Spawn
+    if (aiU.length < 10 && this.aRes >= 40) {
+      const pool = [];
+      if (this.aRes>=120) pool.push('TANK');
+      if (this.aRes>=100) pool.push('BOMBER');
+      if (this.aRes>= 75) pool.push('FIGHTER','FIGHTER');
+      if (this.aRes>= 50) pool.push('MINER');
+                          pool.push('SCOUT','SCOUT');
+      const type = pool[Math.floor(Math.random()*pool.length)];
+      if (this.aRes >= DEFS[type][iCOST]) {
+        this._add(type,'ai', W-52, H/2+(Math.random()-.5)*130);
+        this.aRes -= DEFS[type][iCOST];
+      }
+    }
+
+    // ─ Send miners to nearest uncaptured node
+    const miners = aiU.filter(u=>u.type==='MINER');
+    if (miners.length>0 && uncap.length>0) {
+      for (const m of miners) {
+        const n = uncap.reduce((b,c) => dist(m,c)<dist(m,b)?c:b);
+        m.order={kind:'move'}; m.tx=n.x; m.ty=n.y;
+      }
+    }
+
+    // ─ Combat units strategy
+    const combat = aiU.filter(u=>u.type!=='MINER');
+    if (!combat.length) return;
+
+    const adv = aiU.length - plU.length;
+    let dest = null;
+    const r = Math.random();
+
+    if (r < 0.50 && plU.length>0) {
+      // Attack a player unit
+      const t = plU[Math.floor(Math.random()*plU.length)];
+      dest = {x:t.x, y:t.y};
+    } else if (r < 0.78 && foeN.length>0) {
+      // Attack a player-held node
+      const n = foeN[Math.floor(Math.random()*foeN.length)];
+      dest = {x:n.x, y:n.y};
+    } else if (neuN.length>0) {
+      // Grab neutral node
+      const n = neuN[Math.floor(Math.random()*neuN.length)];
+      dest = {x:n.x, y:n.y};
+    } else if (myN.length>0) {
+      // Rally at own node
+      const n = myN[Math.floor(Math.random()*myN.length)];
+      dest = {x:n.x, y:n.y};
+    }
+
+    if (!dest) return;
+
+    // Split: when outnumbered keep 40% defending
+    const atkCount = adv >= 0 ? combat.length : Math.ceil(combat.length * 0.6);
+    for (let i=0; i<combat.length; i++) {
+      const u = combat[i];
+      if (i < atkCount) {
+        u.order={kind:'move'};
+        u.tx = dest.x + (Math.random()-.5)*50;
+        u.ty = dest.y + (Math.random()-.5)*50;
+      } else if (myN.length>0) {
+        const n = myN[Math.floor(Math.random()*myN.length)];
+        u.order={kind:'move'};
+        u.tx = n.x + (Math.random()-.5)*55;
+        u.ty = n.y + (Math.random()-.5)*55;
+      }
+    }
+  }
+
+  // ── Effects
+  _fx(x,y,type) {
+    const life = type==='boom' ? 0.55 : 0.28;
+    this.fxs.push({x,y,type,life,maxLife:life});
+  }
+
+
+  // ── Input
+  onDown(e) {
+    if (this.over || e.button!==0) return;
+    const p = mxy(e);
+    this.drag = {sx:p.x, sy:p.y, ex:p.x, ey:p.y, active:false};
+  }
+  onMove(e) {
+    if (!this.drag) return;
+    const p = mxy(e);
+    this.drag.ex=p.x; this.drag.ey=p.y;
+    if (!this.drag.active) {
+      const dx=p.x-this.drag.sx, dy=p.y-this.drag.sy;
+      if (dx*dx+dy*dy > 36) this.drag.active=true;
+    }
+  }
+  onUp(e) {
+    if (this.over || e.button!==0) return;
+    const p = mxy(e);
+    if (this.drag?.active) {
+      const x0=Math.min(this.drag.sx,p.x), x1=Math.max(this.drag.sx,p.x);
+      const y0=Math.min(this.drag.sy,p.y), y1=Math.max(this.drag.sy,p.y);
+      if (!e.shiftKey) this.sel.clear();
+      for (const u of this.units)
+        if (u.faction==='player' && u.x>=x0&&u.x<=x1&&u.y>=y0&&u.y<=y1)
+          this.sel.add(u.id);
+    } else {
+      const hit = this.units.find(u=>u.faction==='player' && dist(u,p)<DEFS[u.type][iSZ]+6);
+      if (hit) {
+        if (e.shiftKey) this.sel.has(hit.id)?this.sel.delete(hit.id):this.sel.add(hit.id);
+        else { this.sel.clear(); this.sel.add(hit.id); }
+      } else if (!e.shiftKey) {
+        this.sel.clear();
+      }
+    }
+    this.drag = null;
+  }
+  onRight(e) {
+    e.preventDefault();
+    if (this.over || this.sel.size===0) return;
+    const p  = mxy(e);
+    const en = this.units.find(u=>u.faction==='ai' && dist(u,p)<DEFS[u.type][iSZ]+9);
+    const sel = this.units.filter(u=>this.sel.has(u.id));
+    const n  = sel.length;
+    sel.forEach((u,i) => {
+      const ang  = (i/n)*Math.PI*2;
+      const rad  = n>1 ? Math.min(n*9,55) : 0;
+      if (en) {
+        u.order={kind:'attack',tid:en.id};
+        u.tx=en.x; u.ty=en.y;
+      } else {
+        u.order={kind:'move'};
+        u.tx = p.x+Math.cos(ang)*rad;
+        u.ty = p.y+Math.sin(ang)*rad;
+      }
+    });
+  }
+  onKey(e) {
+    if (e.key==='a'||e.key==='A')
+      this.sel = new Set(this.units.filter(u=>u.faction==='player').map(u=>u.id));
+  }
+
+  // ── HUD
+  _hud() {
+    const $=id=>document.getElementById(id);
+    $('hres').textContent = Math.floor(this.pRes);
+    $('hres').className = this.pRes<80 ? 'hv warn' : 'hv';
+    $('hnodes').textContent = this.nodes.filter(n=>n.owner==='player').length+' / 9';
+    document.querySelectorAll('.sb').forEach(b => {
+      b.disabled = this.over || this.pRes < DEFS[b.dataset.t][iCOST];
+    });
+    const sel = this.units.filter(u=>this.sel.has(u.id));
+    if (sel.length>0) {
+      const names = [...new Set(sel.map(u=>u.type[0]+u.type.slice(1).toLowerCase()))].join(', ');
+      $('hstat').textContent = `${sel.length} selected: ${names}`;
+    } else {
+      $('hstat').textContent = 'Click/drag to select  ·  Right-click to order  ·  A=select all';
+    }
+  }
+
+
+  // ══════════════════════════════════════
+  //  RENDER
+  // ══════════════════════════════════════
+  render() {
+    // Background
+    CX.fillStyle = '#03030d';
+    CX.fillRect(0,0,W,H);
+
+    // Stars with gentle twinkle
+    CX.save();
+    for (const s of STARS) {
+      const tw = 0.55 + 0.45*Math.sin(this.t*1.4 + s.phase);
+      CX.globalAlpha = s.a * tw;
+      CX.fillStyle = '#ffffff';
+      CX.beginPath(); CX.arc(s.x,s.y,s.r,0,Math.PI*2); CX.fill();
+    }
+    CX.restore();
+
+    // Nodes
+    for (const n of this.nodes) this._drawNode(n);
+
+    // Death explosions (behind units)
+    for (const e of this.fxs) if (e.type==='boom') this._drawFx(e);
+
+    // Units
+    for (const u of this.units) this._drawUnit(u);
+
+    // Hit sparks (on top)
+    for (const e of this.fxs) if (e.type==='hit') this._drawFx(e);
+
+    // Drag box
+    if (this.drag?.active) {
+      const {sx,sy,ex,ey} = this.drag;
+      const x=Math.min(sx,ex), y=Math.min(sy,ey), w=Math.abs(ex-sx), h=Math.abs(ey-sy);
+      CX.fillStyle   = 'rgba(70,150,255,0.07)';
+      CX.strokeStyle = 'rgba(70,150,255,0.70)';
+      CX.lineWidth = 1;
+      CX.fillRect(x,y,w,h);
+      CX.strokeRect(x,y,w,h);
+    }
+
+    // Game-over overlay
+    if (this.over) {
+      CX.fillStyle = 'rgba(0,0,0,0.76)';
+      CX.fillRect(0,0,W,H);
+      CX.textAlign = 'center';
+      CX.font = 'bold 30px Courier New';
+      CX.fillStyle = this.msgC;
+      CX.fillText(this.msg, W/2, H/2-6);
+      CX.font = '14px Courier New';
+      CX.fillStyle = '#555';
+      CX.fillText('Press F5 to restart', W/2, H/2+26);
+      CX.textAlign = 'left';
+    }
+  }
+
+  _drawNode(n) {
+    const col = NCOL[n.owner];
+    CX.save();
+    CX.translate(n.x, n.y);
+
+    // Capture-zone flash glow on ownership change
+    if (n.flashT>0) {
+      const a = Math.floor((n.flashT/0.7)*50).toString(16).padStart(2,'0');
+      CX.beginPath(); CX.arc(0,0,CAP_R*0.65,0,Math.PI*2);
+      CX.fillStyle = col+a; CX.fill();
+    }
+
+    // Faint capture radius ring
+    CX.beginPath(); CX.arc(0,0,CAP_R,0,Math.PI*2);
+    CX.strokeStyle = col+'28'; CX.lineWidth=1; CX.stroke();
+
+    // Capture progress arc
+    const abs = Math.abs(n.ticks);
+    if (abs > 1) {
+      const arcCol = n.ticks>0 ? '#2266ff' : '#ff3322';
+      CX.beginPath();
+      CX.arc(0,0,27,-Math.PI/2,-Math.PI/2+(abs/CAP_FULL)*Math.PI*2);
+      CX.strokeStyle=arcCol; CX.lineWidth=3; CX.stroke();
+    }
+
+    // Asteroid body
+    const v = ASHAPES[n.id];
+    CX.beginPath();
+    CX.moveTo(v[0][0],v[0][1]);
+    for (let i=1;i<v.length;i++) CX.lineTo(v[i][0],v[i][1]);
+    CX.closePath();
+    CX.fillStyle = '#131322'; CX.fill();
+    CX.strokeStyle = col; CX.lineWidth = n.owner==='neutral'?1:2; CX.stroke();
+
+    // Core mineral glow
+    const g = CX.createRadialGradient(0,0,0,0,0,9);
+    g.addColorStop(0, col+'cc');
+    g.addColorStop(1, col+'00');
+    CX.fillStyle=g; CX.beginPath(); CX.arc(0,0,9,0,Math.PI*2); CX.fill();
+
+    CX.restore();
+  }
+
+  _drawUnit(u) {
+    const d   = DEFS[u.type];
+    const sz  = d[iSZ];
+    const ai  = u.faction==='ai';
+    const col = ai ? ACOL[u.type] : PCOL[u.type];
+    const sel = this.sel.has(u.id);
+
+    CX.save();
+    CX.translate(u.x, u.y);
+
+    // Hit flash
+    if (u.flashT>0) CX.globalAlpha = 0.35 + 0.65*(u.flashT/0.12);
+
+    // Selection ring
+    if (sel) {
+      CX.beginPath(); CX.arc(0,0,sz+6,0,Math.PI*2);
+      CX.strokeStyle='rgba(255,255,255,0.65)';
+      CX.lineWidth=1.5; CX.setLineDash([4,4]); CX.stroke(); CX.setLineDash([]);
+    }
+
+    // Shape by unit type
+    CX.beginPath();
+    switch(u.type) {
+      case 'SCOUT':    // Triangle
+        CX.moveTo(0,-sz); CX.lineTo(sz*.87,sz*.5); CX.lineTo(-sz*.87,sz*.5);
+        CX.closePath(); break;
+      case 'MINER':    // Diamond
+        CX.moveTo(0,-sz); CX.lineTo(sz,0); CX.lineTo(0,sz); CX.lineTo(-sz,0);
+        CX.closePath(); break;
+      case 'FIGHTER':  // Circle
+        CX.arc(0,0,sz,0,Math.PI*2); break;
+      case 'BOMBER':   // Pentagon
+        for(let i=0;i<5;i++){const a=(i/5)*Math.PI*2-Math.PI/2; i?CX.lineTo(Math.cos(a)*sz,Math.sin(a)*sz):CX.moveTo(Math.cos(a)*sz,Math.sin(a)*sz);}
+        CX.closePath(); break;
+      case 'TANK':     // Hexagon
+        for(let i=0;i<6;i++){const a=(i/6)*Math.PI*2; i?CX.lineTo(Math.cos(a)*sz,Math.sin(a)*sz):CX.moveTo(Math.cos(a)*sz,Math.sin(a)*sz);}
+        CX.closePath(); break;
+    }
+
+    CX.fillStyle   = col + (ai?'bb':'ee');
+    CX.fill();
+    CX.strokeStyle = ai ? '#ffaaaaaa' : '#ffffffcc';
+    CX.lineWidth   = 1.5;
+    CX.stroke();
+    CX.globalAlpha = 1;
+
+    // HP bar
+    const bw=sz*2.6, bh=3, by=sz+4;
+    CX.fillStyle='#111'; CX.fillRect(-bw/2,by,bw,bh);
+    const hp=u.hp/u.mhp;
+    CX.fillStyle = hp>.6?'#44ee44':hp>.3?'#ffcc00':'#ff3333';
+    CX.fillRect(-bw/2,by,bw*hp,bh);
+
+    CX.restore();
+  }
+
+  _drawFx(e) {
+    const p = 1 - e.life/e.maxLife;   // 0→start, 1→end
+    CX.save(); CX.translate(e.x,e.y); CX.globalAlpha=1-p;
+    if (e.type==='hit') {
+      CX.fillStyle='#ffff99';
+      CX.beginPath(); CX.arc(0,0,3+p*8,0,Math.PI*2); CX.fill();
+    } else {
+      CX.strokeStyle='#ff6600'; CX.lineWidth=2;
+      CX.beginPath(); CX.arc(0,0,p*24,0,Math.PI*2); CX.stroke();
+      for(let i=0;i<8;i++){
+        const a=(i/8)*Math.PI*2;
+        CX.strokeStyle=i%2?'#ffff44':'#ff8800'; CX.lineWidth=1.5;
+        CX.beginPath(); CX.moveTo(0,0); CX.lineTo(Math.cos(a)*p*18,Math.sin(a)*p*18); CX.stroke();
+      }
+    }
+    CX.restore(); CX.globalAlpha=1;
+  }
+}
+
+
+// ── Helpers
+function dist(a,b){return Math.sqrt((a.x-b.x)**2+(a.y-b.y)**2);}
+function mxy(e){const r=CV.getBoundingClientRect();return{x:e.clientX-r.left,y:e.clientY-r.top};}
+
+// ── Boot
+const G = window.G = new Game();
+let lastT = performance.now();
+
+(function loop(ts) {
+  const dt = Math.min((ts-lastT)/1000, 0.05);
+  lastT = ts;
+  G.update(dt);
+  G.render();
+  requestAnimationFrame(loop);
+})(performance.now());
+
+CV.addEventListener('mousedown',   e=>G.onDown(e));
+CV.addEventListener('mousemove',   e=>G.onMove(e));
+CV.addEventListener('mouseup',     e=>G.onUp(e));
+CV.addEventListener('contextmenu', e=>G.onRight(e));
+document.addEventListener('keydown', e=>G.onKey(e));
+</script>
+</body>
+</html>

@@ -41,15 +41,8 @@ $ python3 -m http.server 8000
 *   **Config Files:** No external configuration files are used; variables like `NCOL` (Node Colors), `CAP_FULL` (Capture Full capacity), and unit definitions (`ASHAPES`, `DEFS`) must be defined globally before the script executes.
 *   **CLI Flags:** None detected.
 
-## 7. Folder Structure
-```text
-rt-asteroid-engine/
-├── index.html            # Main entry point containing <canvas> element and event listeners.
-├── game.js              # The Game class (containing G), render logic, update loop.
-└── config.js            # (Implied) Defines global constants like NCOL, ASHAPES, DEFS.
-```
 
-## 8. Contributing
+## 7. Contributing
 If you wish to contribute improvements:
 1.  **Fork** the repository.
 2.  **Create a feature branch** (`git checkout -b feature/new-unit`).
